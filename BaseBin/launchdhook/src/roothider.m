@@ -17,6 +17,7 @@ extern int posix_spawnattr_getprocesstype_np(const posix_spawnattr_t *__restrict
 extern int posix_spawnattr_setexceptionports_np(posix_spawnattr_t *__restrict, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t) __OSX_AVAILABLE_STARTING(__MAC_10_5, __IPHONE_2_0);
 
 //from launchdhook/spawn_hook.c
+extern int systemwide_trust_file_by_path(const char *path);
 extern int platform_set_process_debugged(uint64_t pid, bool fullyDebugged);
 extern int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict]);
 extern int __posix_spawn_orig_wrapper(pid_t *restrict pid, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict]);
@@ -63,6 +64,16 @@ void roothide_launchd_postinit(bool firstLoad)
 		{
 			hideDeveloperMode();
 		}
+		
+#ifdef __arm64e__
+		if (!__builtin_available(iOS 16.0, *))
+		{
+			if(roothide_config_set_spinlock_fix(dyld_patch_enabled()) != 0) {
+				launchd_panic("roothide_config_set_spinlock_fix failed");
+				return;
+			}
+		}
+#endif
 	}
 	else
 	{		
@@ -108,6 +119,12 @@ void roothide_launchd_postinit(bool firstLoad)
 	assert(initJailbreakd(firstLoad) == 0);
 }
 
+extern int roothide_trust_executable_recurse(const char *executablePath, xpc_object_t preferredArchsArray);
+int roothide_launchd_trust_executable(const char* path)
+{
+	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, NULL);
+}
+
 int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
 {
 	//spawn_prehook ensure this is always available
@@ -133,6 +150,15 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 		envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
 	}
 
+#ifdef __arm64e__
+	if (!__builtin_available(iOS 16.0, *))
+	{
+		if(!dyld_patch_enabled() && process_force_dyld_patch(path, argv)) {
+			envbuf_setenv(&envc, "SPINLOCK_FIX_DISABLED", "1");
+		}
+	}
+#endif
+
 	int pid = 0;
 	int ret = __posix_spawn_orig_wrapper(&pid, path, desc, argv, envc);
 	if(pidp) *pidp = pid;
@@ -145,6 +171,33 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 		if(should_suspend) {
 			jbdSpawnPatchChild(pid, should_resume);
 		}
+	} else {
+		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
+	}
+
+	return ret;
+}
+
+int roothide_launchd___posix_spawn__spinlock_fix_only(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
+{
+	//spawn_prehook ensure this is always available
+	posix_spawnattr_t attrp = &desc->attrp;
+
+	short flags = 0;
+	posix_spawnattr_getflags(attrp, &flags);
+
+	bool should_resume = (flags & POSIX_SPAWN_START_SUSPENDED)==0;
+
+	posix_spawnattr_setflags(attrp, flags | POSIX_SPAWN_START_SUSPENDED);
+
+	int pid = 0;
+	int ret = __posix_spawn_orig_wrapper(&pid, path, desc, argv, envp);
+	if(pidp) *pidp = pid;
+	
+	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
+
+	if (ret == 0 && pid > 0) {
+		jbdSpinlockFixOnly(pid, should_resume);
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
 	}
@@ -225,11 +278,11 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 
 		JBLogDebug("blacklisted app %s", path);
 
-		if(iOS15Arm64e && roothideBlacklisted && (strstr(path, "/PlugIns/") || strstr(path, ".appex/"))) {
+		if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (strstr(path, "/PlugIns/") || strstr(path, ".appex/"))) {
 			JBLogDebug("prevent blacklisted app's extension from running: ", path);
 			ret = EPERM;
 		}
-		else if(iOS15Arm64e && roothideBlacklisted && (envbuf_getenv(envp, "ActivePrewarm") || envbuf_getenv(envp, "DYLD_USE_CLOSURES"))) {
+		else if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (envbuf_getenv(envp, "ActivePrewarm") || envbuf_getenv(envp, "DYLD_USE_CLOSURES"))) {
 			JBLogDebug("prevent blacklisted app from prewarming: ", path);
 			ret = EPERM;
 		}
@@ -251,10 +304,10 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	
 			volatile pid_t* blacklistedPidp = allocBlacklistProcessId();
 	
-			if(roothideBlacklisted) {
+			if(roothideBlacklisted || !dyld_patch_enabled() || !iOS15Arm64e) {
 				ret = __posix_spawn_orig_wrapper(blacklistedPidp, path, desc, argv, envc);
 			} else {
-				ret = roothide_launchd___posix_spawn_posthook(blacklistedPidp, path, desc, argv, envc);
+				ret = roothide_launchd___posix_spawn__spinlock_fix_only(blacklistedPidp, path, desc, argv, envc);
 			}
 	
 			pid_t pid = *blacklistedPidp;
